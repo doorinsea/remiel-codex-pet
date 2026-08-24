@@ -1,0 +1,27 @@
+{
+  "launch_apps": [
+    {
+      "name": "微信",
+      "match": ["Weixin", "WeChat"],
+      "exe": ["Weixin.exe", "WeChat.exe"],
+      "icon": "wechat.png"
+    },
+    {
+      "name": "Steam",
+      "match": ["Steam"],
+      "exe": ["steam.exe"],
+      "icon": "steam.png"
+    },
+    {
+      "name": "WPS",
+      "match": ["WPS Office"],
+      "exe": ["wps.exe"],
+      "icon": "wps.png"
+    },
+    {
+      "name": "Visual Studio Code",
+      "match": ["Visual Studio Code"],
+      "exe": ["Code.exe"]
+    }
+  ]
+}

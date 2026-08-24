@@ -9,6 +9,30 @@
 2. 依赖：`pillow`、`pynput`（PyInstaller 打包 exe 也需要）。
 3. 单实例：重复启动会自动退出。
 
+## 配置（通用化，无个人路径）
+
+项目不写死任何个人路径，所有应用都在运行时自动探测安装位置：
+
+- 右键菜单（微信 / Steam / WPS 等）：按“注册表卸载项 → 常见安装路径 → 显式路径”的
+  顺序自动探测，找不到的项自动隐藏。
+- 双击打开 Codex：自动从已安装应用列表探测 Codex 桌面应用；探测不到时回退到默认别名。
+- 会话目录：默认 `~/.codex/sessions`，可用环境变量 `CODEX_HOME` / `CODEX_PET_SESSIONS` 修改。
+
+如需自定义菜单应用，把 `config.example.json` 复制为 `config.json` 放在 exe（或脚本）
+同目录，按需增删即可；每项字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| name | 菜单显示名 |
+| match | 注册表卸载项 DisplayName 匹配关键字（可多个） |
+| exe | 可执行文件名，用于拼接安装目录 |
+| paths | 常见安装路径（支持 `*` 通配符） |
+| path | 显式路径（存在则优先使用） |
+| icon | 菜单图标 PNG 文件名（可省略，省略时用首字兜底图标） |
+
+`launch_apps` 配置存在时会**完全替代**默认列表；也可用环境变量 `CODEX_PET_CONFIG`
+指定配置文件位置。`config.json` 已被 .gitignore 排除，不会进仓库。
+
 ## 状态说明
 
 | 状态 | 触发时机 |
@@ -76,7 +100,7 @@ WSL 里跑的 Codex 会话看不到。可用环境变量 `CODEX_PET_SESSIONS` �
 ## 自定义
 
 - 换动画：直接替换 `素材/` 下同名 GIF，重启生效。
-- 换菜单：编辑 `silent_pet.py` 顶部的 `LAUNCH_APPS` 列表。
+- 换菜单：编辑 `config.json`（推荐），或 `silent_pet.py` 顶部的 `DEFAULT_LAUNCH_APPS`。
 - 气泡样式：编辑 `silent_pet.py` 顶部 `BUBBLE_*` 常量（颜色、透明度、文案）。
 
 ## 与公开版的区别

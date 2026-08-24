@@ -16,6 +16,9 @@ uia_result.txt
 桌宠.exe
 蕾米埃尔codex桌宠.exe
 
+# 本机配置（个人化，不进仓库；模板见 config.example.json）
+config.json
+
 # 系统文件
 Thumbs.db
 Desktop.ini
