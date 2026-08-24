@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 桌宠运行日志与临时文件
+_pet.log
+uia_result.txt
+
+# 打包后的 exe（体积大不进仓库；需要时用 build_pet.bat 自行打包）
+桌宠.exe
+蕾米埃尔codex桌宠.exe
+
+# 系统文件
+Thumbs.db
+Desktop.ini
