@@ -7,6 +7,15 @@
 `happy` 并显示微信风格气泡，点击气泡或宠物即可收回；Codex 征求权限时弹出粉色
 审批窗口，可直接“允许 / 总是允许 / 拒绝”。
 
+## 下载
+
+[![Download](https://img.shields.io/badge/Download-remiel--codex--pet%20v1.0.0-FF7FA3?style=for-the-badge&logo=github)](https://github.com/doorinsea/remiel-codex-pet/releases/latest/download/remiel-codex-pet-v1.0.0.zip)
+
+⬇️ **免安装版（解压即用）**：[下载 v1.0.0](https://github.com/doorinsea/remiel-codex-pet/releases/latest/download/remiel-codex-pet-v1.0.0.zip)
+—— Windows，无需安装 Python，解压后双击 `蕾米埃尔codex桌宠.exe` 即可。也可到
+[Releases](https://github.com/doorinsea/remiel-codex-pet/releases) 页面选择版本，
+或点右上角 **Code → Download ZIP** 获取源码。
+
 ## 状态图鉴
 
 ![状态图鉴](assets/readme/gallery.jpg)
