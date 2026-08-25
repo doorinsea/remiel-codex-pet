@@ -9,13 +9,7 @@
 
 ## 状态图鉴
 
-| 待机 · silent | 思考中 · think | 完成庆祝 · happy |
-| --- | --- | --- |
-| ![silent](assets/readme/state-silent.png) | ![think](assets/readme/state-think.png) | ![happy](assets/readme/state-happy.png) |
-
-| 键盘唤醒 · work | 单击反馈 · afterclick |
-| --- | --- |
-| ![work](assets/readme/state-work.png) | ![afterclick](assets/readme/state-afterclick.png) |
+![状态图鉴](assets/readme/gallery.jpg)
 
 ## 状态语义与素材设计思路
 
