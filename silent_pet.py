@@ -923,10 +923,13 @@ class DesktopPet:
         self._do_render_frames()
         log_msg(f"缩放完成: {self._pet_size}px")
 
-    def _set_state(self, st):
+    def _set_state(self, st, force=False):
         if st == self._state:
             return
         if st not in self._frames:
+            return
+        # happy 保持期（5 秒）：除用户主动操作（force）外不切换其它状态
+        if self._state == "happy" and st != "happy" and not force:
             return
         # think 是“思考锁定”状态：只允许 watcher 在完成时切到 happy，
         # 其余状态（work/afterclick/silent 等）一律不允许打断思考
@@ -997,6 +1000,8 @@ class DesktopPet:
     def _codex_busy(self):
         if not self._alive:
             return
+        if self._state == "happy":
+            return                       # happy 保持期不被思考打断
         self._cancel_happy_timer()
         self._hide_bubble()
         self._approval_hide()
@@ -1181,7 +1186,7 @@ class DesktopPet:
         """单击收回：气泡消失，happy 结束（不打开任何窗口）"""
         self._cancel_happy_timer()
         self._hide_bubble()
-        self._set_state("afterclick")
+        self._set_state("afterclick", force=True)
         log_msg("单击收回气泡 → afterclick → silent")
 
     # ─────────────── Codex 审批窗口（粉色不透明） ───────────────
