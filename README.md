@@ -26,7 +26,7 @@
 | --- | --- | --- | --- |
 | silent | 默认待机 | silent.gif | 安静循环，不打扰 |
 | think | 任意会话 `task_started` / `user_message` | think.gif | 思考锁定：只允许完成时切到 happy，单击、键盘连击等都不会打断 |
-| happy | 任一任务 `final_answer` / `task_complete` | happy.gif | 完成庆祝，保持 3 秒；单击可提前收回；若仍有任务在思考则回 think，否则回 silent |
+| happy | 任一任务 `final_answer` / `task_complete` | happy.gif | 完成庆祝，保持 5 秒；单击可提前收回；若仍有任务在思考则回 think，否则回 silent |
 | work | 键盘 2 秒内连击 8 次 | work.gif | 手动唤醒动画，与 Codex 状态无关，播完自动退出 |
 | afterclick | 单击宠物（非思考/完成状态） | afterclick.gif | 单击反馈，播放一次回 silent，不打开任何窗口 |
 
@@ -79,7 +79,7 @@
 ## 气泡
 
 Codex 完成思考后，宠物上方弹出**微信风格白色圆角气泡**（粉色不透明），文案为
-“爱思考先生/小姐，你的任务已经完成了~”。默认保持 3 秒自动收起（期间单击可提前收回）；
+“爱思考先生/小姐，你的任务已经完成了~”。默认保持 5 秒自动收起（期间单击可提前收回）；
 多条会话并行时，只要还有任务在思考，气泡收起后宠物会回到 think。气泡跟随宠物拖拽移动。
 
 ## 审批窗口
@@ -103,7 +103,7 @@ Codex 征求权限时，宠物弹出**粉色不透明审批窗口**，只显示�
 只跟踪**真实用户任务**，忽略 Codex 内部自动审批评估线程（guardian）：
 
 - 任意会话 `task_started` / `user_message` → think（思考中）
-- 任意会话 `agent_message(phase=final_answer)` / `task_complete` → happy + 气泡（3 秒）
+- 任意会话 `agent_message(phase=final_answer)` / `task_complete` → happy + 气泡（5 秒）
 - `function_call` 带 `sandbox_permissions=require_escalated` → 观察 3 秒 + 探测审批卡片，
   确认需人工授权才弹窗；直到对应 `function_call_output` 出现才视为已处理
 - 思考中判定：会话处于 busy 且日志文件 **5 分钟内有新写入**；中断/漏写完成标记的
@@ -140,7 +140,7 @@ Codex 征求权限时，宠物弹出**粉色不透明审批窗口**，只显示�
 ## 与公开版的区别
 
 - 去掉“单击打开对话窗 + API 配置”整套功能；
-- `happy` 由“播一次”改为“保持 3 秒，单击可提前收回”；
+- `happy` 由“播一次”改为“保持 5 秒，单击可提前收回”；
 - `think` / `happy` 由 Codex 会话状态驱动，支持多会话并行聚合；
 - 新增微信风格气泡与“单击收回”交互；
 - 新增审批窗口：Codex 征求权限时弹出，可直接允许 / 总是允许 / 拒绝；

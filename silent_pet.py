@@ -112,7 +112,7 @@ APPROVAL_BTN_ALLOW = "允许"
 APPROVAL_BTN_ALWAYS = "总是允许"
 APPROVAL_BTN_DENY = "拒绝"
 
-HAPPY_HOLD_MS = 3000            # happy 完成后自动保持 3 秒，再决定回 think / silent
+HAPPY_HOLD_MS = 5000            # happy 完成后自动保持 5 秒，再决定回 think / silent
 
 # ── 应用菜单：运行时自动探测安装位置（不再写死个人路径）──
 # 每项支持字段：
@@ -366,7 +366,7 @@ class CodexWatcher(threading.Thread):
         self._stop = True
 
     def is_any_busy(self):
-        """主线程读取：当前是否还有会话在思考（决定 happy 3 秒后回 think 还是 silent）"""
+        """主线程读取：当前是否还有会话在思考（决定 happy 5 秒后回 think 还是 silent）"""
         return self._any_busy
 
     def _all_files(self):
@@ -1026,10 +1026,10 @@ class DesktopPet:
         self._hide_bubble()
         if self._watcher.is_any_busy():
             self._set_state("think")
-            log_msg("happy 3 秒结束 → 仍有会话思考中，回到 think")
+            log_msg("happy 5 秒结束 → 仍有会话思考中，回到 think")
         else:
             self._set_state("silent")
-            log_msg("happy 3 秒结束 → 无任务，回到 silent")
+            log_msg("happy 5 秒结束 → 无任务，回到 silent")
 
     def _reconcile_state(self):
         """状态变化后的环境复检：若 Codex 仍在思考，则回到 think 状态"""
