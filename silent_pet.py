@@ -32,7 +32,6 @@ import sys
 import json
 import io
 import time
-import glob
 import re
 import threading
 import subprocess
@@ -122,52 +121,7 @@ PLUGINS_DIR = os.path.join(PROGRAM_DIR, "plugins")
 BALANCE_REFRESH_MS = 60000      # 余额徽章刷新间隔
 FLASH_STEPS = ["#FFFFFF", "#FFF3F8", "#FFE0ED", "#FFD0E2"]  # 阶段转换白光渐变
 
-# ── 应用菜单：运行时自动探测安装位置（不再写死个人路径）──
-# 每项支持字段：
-#   name   菜单显示名
-#   match  注册表卸载项 DisplayName 的匹配关键字（可多个）
-#   exe    可执行文件名（用于拼接 InstallLocation）
-#   paths  常见安装路径（支持 * 通配符）
-#   path   显式路径（存在则优先使用）
-#   icon   菜单图标 PNG 文件名（可省略，省略时用首字兜底图标）
-# 探测不到的项自动隐藏。可在 config.json（同目录，或用环境变量
-# CODEX_PET_CONFIG 指定位置）里用 launch_apps 覆盖默认列表。
 CONFIG_FILE = os.environ.get("CODEX_PET_CONFIG") or os.path.join(PROGRAM_DIR, "config.json")
-
-DEFAULT_LAUNCH_APPS = [
-    {
-        "name": "微信",
-        "icon": "wechat.png",
-        "match": ["Weixin", "WeChat"],
-        "exe": ["Weixin.exe", "WeChat.exe"],
-        "paths": [
-            r"C:\Program Files\Tencent\Weixin\Weixin.exe",
-            r"C:\Program Files (x86)\Tencent\Weixin\Weixin.exe",
-            r"C:\Program Files\Tencent\WeChat\WeChat.exe",
-        ],
-    },
-    {
-        "name": "Steam",
-        "icon": "steam.png",
-        "match": ["Steam"],
-        "exe": ["steam.exe"],
-        "paths": [
-            r"C:\Program Files (x86)\Steam\steam.exe",
-            r"C:\Program Files\Steam\steam.exe",
-            r"C:\Program Files (x86)\steam+\steam.exe",
-        ],
-    },
-    {
-        "name": "WPS",
-        "icon": "wps.png",
-        "match": ["WPS Office"],
-        "exe": ["wps.exe"],
-        "paths": [
-            os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                         "Kingsoft", "WPS Office", "*", "office6", "wps.exe"),
-        ],
-    },
-]
 
 
 def load_config():
@@ -221,112 +175,6 @@ def load_plugins():
     return out
 
 
-def _reg_uninstall_entries():
-    """遍历注册表卸载项，产出 {DisplayName, DisplayIcon, InstallLocation}"""
-    import winreg
-    roots = [
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
-    ]
-    for root, path in roots:
-        try:
-            key = winreg.OpenKey(root, path)
-        except OSError:
-            continue
-        try:
-            i = 0
-            while True:
-                try:
-                    sub = winreg.EnumKey(key, i)
-                    i += 1
-                except OSError:
-                    break
-                try:
-                    sk = winreg.OpenKey(key, sub)
-                except OSError:
-                    continue
-                d = {}
-                for val in ("DisplayName", "DisplayIcon", "InstallLocation"):
-                    try:
-                        d[val], _ = winreg.QueryValueEx(sk, val)
-                    except OSError:
-                        pass
-                try:
-                    winreg.CloseKey(sk)
-                except OSError:
-                    pass
-                yield d
-        finally:
-            try:
-                winreg.CloseKey(key)
-            except OSError:
-                pass
-
-
-def _exe_candidates(d, exes):
-    """由注册表条目推导候选 exe 路径"""
-    out = []
-    icon = (d.get("DisplayIcon") or "").strip()
-    icon_path = icon.split(",")[0].strip().strip('"') if icon else ""
-    if icon_path:
-        if icon_path.lower().endswith(".exe"):
-            if exes and os.path.basename(icon_path).lower() in [e.lower() for e in exes]:
-                out.append(icon_path)
-            # DisplayIcon 常指向 uninstall.exe：去同目录找目标 exe
-            if exes:
-                dname = os.path.dirname(icon_path)
-                for exe in exes:
-                    out.append(os.path.join(dname, exe))
-    loc = (d.get("InstallLocation") or "").strip()
-    if loc and exes:
-        for exe in exes:
-            out.append(os.path.join(loc, exe))
-    return out
-
-
-def _detect_app(item):
-    """自动探测某个应用的可执行路径；找不到返回 None"""
-    p = (item.get("path") or "").strip()
-    if p and os.path.isfile(p):
-        return p
-    names = [n.lower() for n in (item.get("match") or [])]
-    exes = item.get("exe") or []
-    for d in _reg_uninstall_entries():
-        disp = (d.get("DisplayName") or "")
-        if names and not any(m in disp.lower() for m in names):
-            continue
-        for cand in _exe_candidates(d, exes):
-            if cand and os.path.isfile(cand):
-                return cand
-    for pat in item.get("paths") or []:
-        for cand in glob.glob(pat):
-            if os.path.isfile(cand):
-                return cand
-        if os.path.isfile(pat):
-            return pat
-    return None
-
-
-def build_launch_apps():
-    """组装右键菜单应用列表：(显示名, 可执行路径, 图标文件名)"""
-    cfg = load_config()
-    spec = cfg.get("launch_apps")
-    if not isinstance(spec, list) or not spec:
-        spec = DEFAULT_LAUNCH_APPS
-    apps = []
-    for item in spec:
-        if isinstance(item, str):      # 兼容：配置里直接写路径
-            item = {"name": os.path.splitext(os.path.basename(item))[0], "path": item}
-        if not isinstance(item, dict):
-            continue
-        exe = _detect_app(item)
-        if exe:
-            apps.append((item.get("name") or os.path.splitext(os.path.basename(exe))[0],
-                         exe, item.get("icon") or ""))
-    return apps
-
-
 def _detect_codex_app_id():
     """自动探测 Codex 桌面应用的 AppID；找不到返回已知别名"""
     known = "OpenAI.Codex_2p2nqsd0c76g0!App"
@@ -370,12 +218,6 @@ def launch_app(path):
     except Exception as e:
         log_msg(f"启动异常 [{path}]: {e}")
         return False
-
-
-# 右键菜单应用列表：启动时自动探测安装位置（配置方式见 config.example.json）
-LAUNCH_APPS = build_launch_apps()
-
-
 # ─────────────────── Codex 会话监听（后台线程） ───────────────────
 
 class CodexWatcher(threading.Thread):
