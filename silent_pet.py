@@ -30,11 +30,14 @@ Codex 状态检测：轮询 ~/.codex/sessions 下最新的会话 JSONL，
 import os
 import sys
 import json
+import io
 import time
 import glob
+import re
 import threading
 import subprocess
 import ctypes
+import importlib.util
 import tkinter as tk
 from tkinter import font as tkfont
 from collections import deque
@@ -114,6 +117,11 @@ APPROVAL_BTN_DENY = "拒绝"
 
 HAPPY_HOLD_MS = 5000            # happy 完成后自动保持 5 秒，再决定回 think / silent
 
+# 插件系统：plugins/ 目录下每个子文件夹 = 一个插件（manifest.json + 入口）
+PLUGINS_DIR = os.path.join(PROGRAM_DIR, "plugins")
+BALANCE_REFRESH_MS = 60000      # 余额徽章刷新间隔
+FLASH_STEPS = ["#FFFFFF", "#FFF3F8", "#FFE0ED", "#FFD0E2"]  # 阶段转换白光渐变
+
 # ── 应用菜单：运行时自动探测安装位置（不再写死个人路径）──
 # 每项支持字段：
 #   name   菜单显示名
@@ -172,6 +180,45 @@ def load_config():
     except Exception as e:
         log_msg(f"config.json 读取失败: {e}")
     return cfg
+
+
+def save_config(updates):
+    """合并写入 config.json（保留已有字段，如 api key / 档位阈值）"""
+    cfg = load_config()
+    cfg.update(updates)
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_msg(f"config.json 写入失败: {e}")
+
+
+def load_plugins():
+    """扫描 plugins/ 目录并导入插件模块，返回 [{manifest, module, dir}]"""
+    out = []
+    try:
+        if not os.path.isdir(PLUGINS_DIR):
+            return out
+        for name in sorted(os.listdir(PLUGINS_DIR)):
+            pdir = os.path.join(PLUGINS_DIR, name)
+            mfile = os.path.join(pdir, "manifest.json")
+            if not os.path.isfile(mfile):
+                continue
+            try:
+                with open(mfile, "r", encoding="utf-8") as fh:
+                    manifest = json.load(fh)
+                entry = manifest.get("entry", "main.py")
+                spec = importlib.util.spec_from_file_location(
+                    f"pet_plugin_{name}", os.path.join(pdir, entry))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                out.append({"manifest": manifest, "module": mod, "dir": pdir})
+                log_msg(f"插件已加载: {manifest.get('name', name)}")
+            except Exception as e:
+                log_msg(f"插件加载失败 [{name}]: {e}")
+    except Exception as e:
+        log_msg(f"plugins 目录读取失败: {e}")
+    return out
 
 
 def _reg_uninstall_entries():
@@ -654,8 +701,6 @@ class DesktopPet:
         self._click_timer = None
         self._suppress_single = 0.0
         self._rb_timer = None
-        self._menu_win = None
-        self._menu_close_after = None
         self._codex_app_id = None    # 双击打开 Codex 用的 AppID（首次使用时探测）
 
         # ── 微信风格气泡 ──
@@ -694,6 +739,31 @@ class DesktopPet:
         )
         self._watcher.start()
 
+        # ── 插件系统：加载 plugins/ 并启动余额类插件 ──
+        self._plugins = load_plugins()
+        self._balance_plugins = [p for p in self._plugins
+                                 if p["manifest"].get("plugin_type") == "balance"]
+        self._balance_api_key = ""
+        self._balance_win = None
+        self._balance_cv = None
+        self._balance_photos = []
+        self._balance_displayed = ""
+        self._balance_last_ok = True
+        self._balance_tiers = [20, 50, 80]
+        self._balance_win_w = 220
+        self._balance_win_h = 60
+        self._balance_tier_key = None
+        self._balance_refresh_id = None
+        self._balance_drag_off = (0, 0)
+        # ── 插件启停状态 + 本地控制台 ──
+        self._enabled_plugins = self._load_enabled_plugins()
+        self._console_port = 0
+        self._pet_preview_cache = None
+        self._plugin_preview_cache = {}
+        self._plugin_offsets = {}   # 缩放过程中的插件偏移（pid -> (x, y)），松手后写回 config
+        self._start_console_server()
+        self._start_balance_plugins()
+
         log_msg(f"蕾米埃尔 Codex 桌宠启动 | 会话目录={CODEX_SESSIONS_DIR}")
         self._animate()
         self._check_work_idle()
@@ -727,6 +797,7 @@ class DesktopPet:
             pass
         self._cancel_happy_timer()
         self._approval_hide()
+        self._close_balance()
         try:
             self.root.destroy()
         except Exception:
@@ -737,10 +808,11 @@ class DesktopPet:
         try:
             self._alive = False
             if getattr(sys, 'frozen', False):
-                exe_path = sys.executable
+                cmd = [sys.executable]
             else:
-                exe_path = os.path.abspath(__file__)
-            subprocess.Popen([exe_path], shell=False, cwd=os.path.dirname(exe_path))
+                cmd = [sys.executable, os.path.abspath(__file__)]
+            subprocess.Popen(cmd,
+                             shell=False, cwd=os.path.dirname(os.path.abspath(__file__)))
         except Exception as e:
             log_msg(f"自动重启失败: {e}")
         try:
@@ -829,16 +901,6 @@ class DesktopPet:
         self._tk_refs = {st: fs for st, fs in self._frames.items()}
         log_msg("动画帧加载完成: " + ", ".join(f"{k}={len(v)}帧" for k, v in self._frames.items()))
 
-    def _resize_pet(self, new_size):
-        """把桌宠缩放到指定边长（像素），动画/窗口/气泡/审批窗一起跟随"""
-        new_size = max(MIN_PET_SIZE, min(MAX_PET_SIZE, int(new_size)))
-        if new_size == self._pet_size:
-            return
-        self._pet_size = new_size
-        self._resize_window_only()
-        self._do_render_frames()
-        log_msg(f"缩放为 {self._pet_size}px")
-
     # ─────────────── 右下角缩放把手 ───────────────
 
     def _draw_resize_handle(self):
@@ -861,16 +923,24 @@ class DesktopPet:
             pass
         self._draw_resize_handle()
 
-    def _resize_window_only(self):
-        """拖动时先只改窗口大小，动画帧稍后异步重渲染，保证流畅"""
+    def _resize_window_only(self, center=None):
+        """拖动时先只改窗口大小，动画帧稍后异步重渲染，保证流畅。
+        center 为缩放锚点（桌宠中心，屏幕坐标）；缺省时取当前窗口中心。"""
         try:
+            if center is None:
+                cx = self.root.winfo_x() + self.root.winfo_width() / 2.0
+                cy = self.root.winfo_y() + self.root.winfo_height() / 2.0
+            else:
+                cx, cy = center
+            new_x = int(cx - self._pet_size / 2.0)
+            new_y = int(cy - self._pet_size / 2.0)
             self.canvas.config(width=self._pet_size, height=self._pet_size)
-            self.root.geometry(
-                f"{self._pet_size}x{self._pet_size}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+            self.root.geometry(f"{self._pet_size}x{self._pet_size}+{new_x}+{new_y}")
             self.canvas.coords(self._img_id, self._pet_size // 2, self._pet_size // 2)
             self._redraw_resize_handle()
             self._place_bubble()
             self._place_approval()
+            self._place_balance()
         except Exception as e:
             log_msg(f"缩放窗口失败: {e}")
 
@@ -904,8 +974,12 @@ class DesktopPet:
             rel_y = e.y_root - self.root.winfo_rooty()
             new_size = max(MIN_PET_SIZE, min(MAX_PET_SIZE, int(max(rel_x, rel_y))))
             if new_size != self._pet_size:
+                old_size = self._pet_size
+                cx = self.root.winfo_x() + old_size / 2.0
+                cy = self.root.winfo_y() + old_size / 2.0
+                self._scale_plugin_offsets(new_size / float(old_size))
                 self._pet_size = new_size
-                self._resize_window_only()
+                self._resize_window_only(center=(cx, cy))
                 self._schedule_render()
         except Exception:
             pass
@@ -913,6 +987,11 @@ class DesktopPet:
     def _finish_resize(self):
         self._resizing = False
         self._suppress_single = time.time()
+        if self._balance_win is not None and self._balance_displayed:
+            try:
+                self._render_balance(self._balance_displayed, self._balance_last_ok)
+            except Exception:
+                pass
         if self._render_after_id is not None:
             try:
                 self.root.after_cancel(self._render_after_id)
@@ -921,6 +1000,16 @@ class DesktopPet:
             self._render_after_id = None
         self._render_pending = False
         self._do_render_frames()
+        if self._plugin_offsets:
+            try:
+                cfg = load_config()
+                pos_map = dict(cfg.get("plugin_positions") or {})
+                for pid, off in self._plugin_offsets.items():
+                    pos_map[pid] = {"x": off[0], "y": off[1]}
+                save_config({"plugin_positions": pos_map})
+            except Exception as e:
+                log_msg(f"缩放后保存插件偏移失败: {e}")
+            self._plugin_offsets = {}
         log_msg(f"缩放完成: {self._pet_size}px")
 
     def _set_state(self, st, force=False):
@@ -1041,7 +1130,7 @@ class DesktopPet:
         if not self._alive:
             return
         try:
-            # happy 展示期间不打断（让 3 秒完整播完），由 _happy_timeout 决定去向
+            # happy 展示期间不打断（让 5 秒完整播完），由 _happy_timeout 决定去向
             if self._state == "happy":
                 return
             if self._watcher.is_any_busy() and self._state != "think":
@@ -1052,6 +1141,502 @@ class DesktopPet:
                 log_msg("状态复检：Codex 仍在思考 → 回到 think")
         except Exception:
             pass
+
+    # ─────────────── 插件：余额徽章（喧响值风格） ───────────────
+
+    def _load_enabled_plugins(self):
+        """读取 config.json 的 enabled_plugins；未配置时默认全部启用"""
+        cfg = load_config()
+        ids = cfg.get("enabled_plugins")
+        if ids is None:
+            return set(p["manifest"].get("id", os.path.basename(p["dir"]))
+                       for p in self._plugins)
+        return set(ids)
+
+    def _start_console_server(self):
+        """启动本地插件控制台（127.0.0.1 + 随机端口）"""
+        try:
+            import console_server
+            self._console_port = console_server.start_console_server(self)
+            log_msg(f"本地控制台已启动: http://127.0.0.1:{self._console_port}/")
+        except Exception as e:
+            log_msg(f"本地控制台启动失败: {e}")
+
+    def _open_console(self):
+        """用默认浏览器打开本地控制台"""
+        try:
+            import webbrowser
+            webbrowser.open(f"http://127.0.0.1:{self._console_port}/")
+            log_msg(f"已打开本地控制台 :{self._console_port}")
+        except Exception as e:
+            log_msg(f"打开控制台失败: {e}")
+
+    def list_plugins(self):
+        """返回插件列表（含启停状态），供控制台页面展示"""
+        out = []
+        for p in self._plugins:
+            m = p["manifest"]
+            pid = m.get("id", os.path.basename(p["dir"]))
+            out.append({
+                "id": pid,
+                "name": m.get("name", pid),
+                "version": m.get("version", ""),
+                "description": m.get("description", ""),
+                "enabled": pid in self._enabled_plugins,
+            })
+        return out
+
+    def set_enabled(self, pid, enabled):
+        """控制台切换插件启停；写配置并即时生效"""
+        try:
+            if enabled:
+                self._enabled_plugins.add(pid)
+            else:
+                self._enabled_plugins.discard(pid)
+            save_config({"enabled_plugins": sorted(self._enabled_plugins)})
+            if pid == "deepseek-balance":
+                if enabled:
+                    self.root.after(0, self._balance_enable)
+                else:
+                    self.root.after(0, self._close_balance)
+            log_msg(f"插件 {pid} -> {'启用' if enabled else '停用'}")
+            return True
+        except Exception as e:
+            log_msg(f"切换插件状态失败 [{pid}]: {e}")
+            return False
+
+    def _balance_enable(self):
+        """重新启用余额插件（徽章 + 定时刷新）"""
+        try:
+            if self._balance_refresh_id is None:
+                self._refresh_balance()
+            log_msg("余额插件已重新启用")
+        except Exception as e:
+            log_msg(f"余额插件启用失败: {e}")
+
+    def _start_balance_plugins(self):
+        cfg = load_config()
+        self._balance_api_key = (cfg.get("deepseek_api_key") or "").strip()
+        tiers = cfg.get("deepseek_balance_tiers") or [20, 50, 80]
+        try:
+            self._balance_tiers = [float(x) for x in tiers][:3] or [20, 50, 80]
+        except Exception:
+            self._balance_tiers = [20, 50, 80]
+        self._load_balance_assets()
+        enabled = "deepseek-balance" in self._enabled_plugins
+        if self._balance_plugins and self._balance_api_key and enabled:
+            self.root.after(500, self._refresh_balance)
+            log_msg("DeepSeek 余额插件已启动（每 60 秒刷新，喧响值风格）")
+        elif self._balance_plugins and not enabled:
+            log_msg("DeepSeek 余额插件当前为停用状态")
+        elif self._balance_plugins:
+            log_msg("DeepSeek 余额插件待命：请在 config.json 填写 deepseek_api_key")
+
+    def _load_balance_assets(self):
+        """加载整卡渲染器（自包含 compose_badge.py，素材由其内部加载）"""
+        self._badge_render = None
+        try:
+            rpath = os.path.join(PLUGINS_DIR, "deepseek-balance", "compose_badge.py")
+            spec = importlib.util.spec_from_file_location("deepseek_balance_render", rpath)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._badge_render = mod
+            log_msg("余额徽章渲染器已加载")
+        except Exception as e:
+            log_msg(f"徽章渲染器加载失败: {e}")
+
+    def _refresh_balance(self):
+        if not self._alive:
+            return
+
+        def worker():
+            try:
+                for p in self._balance_plugins:
+                    fn = getattr(p["module"], "fetch_balance", None)
+                    if not fn:
+                        continue
+                    res = fn(self._balance_api_key)
+                    self.root.after(0, lambda r=res: self._show_balance(r))
+                    break
+            except Exception as e:
+                self.root.after(0, lambda: log_msg(f"余额刷新异常: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+        try:
+            self._balance_refresh_id = self.root.after(
+                BALANCE_REFRESH_MS, self._refresh_balance)
+        except Exception:
+            pass
+
+    def _show_balance(self, res):
+        text = res.get("text", "?")
+        ok = bool(res.get("ok"))
+        if not ok:
+            text = f"余额 {text}"
+        if self._balance_win is None:
+            self._create_balance_win()
+        self._render_balance(text, ok)
+
+    def _balance_tier(self, amount):
+        """反向映射：余额越少等级越高（极→特→喧→无，嘲讽充值）"""
+        t = self._balance_tiers or [10, 50, 100]
+        if amount < t[0]:
+            return "maximum"     # 极
+        if amount < t[1]:
+            return "blasting"    # 特
+        if amount < t[2]:
+            return "uproar"      # 喧
+        return "base"            # 余额充足 → 无等级
+
+    def _render_balance(self, text, ok):
+        m = re.search(r"([\d.]+)", text)
+        amount = None
+        tier = "base"
+        if m:
+            try:
+                amount = float(m.group(1))
+                tier = self._balance_tier(amount)
+            except Exception:
+                amount = None
+        log_msg(f"余额徽章渲染: amount={amount} tier={tier}")
+        if self._balance_win is None or self._balance_cv is None:
+            return
+        if self._balance_tier_key is not None and tier != self._balance_tier_key:
+            self._balance_flash()          # 阶段转换：周边闪一次白光
+        self._balance_tier_key = tier
+        self._balance_displayed = text
+        self._balance_last_ok = ok
+        try:
+            self._draw_balance_content(text, ok, tier, amount)
+        except Exception as e:
+            log_msg(f"余额徽章渲染失败: {e}")
+
+    def _draw_balance_content(self, text, ok, tier, amount):
+        cv = self._balance_cv
+        cv.delete("all")
+        self._balance_photos = []
+        scale = max(0.5, self._pet_size / 200.0)
+        pad_x = 12
+        pad_y = 10
+        x = pad_x
+        if self._badge_render is not None and amount is not None:
+            try:
+                char_h = int(220 * 3 / 16 * 1.5 * 2 / 3 * max(0.5, self._pet_size / 200.0))   # 缩到 2/3
+                img = self._badge_render.compose(tier, f"{amount:.2f}", char_h=char_h)
+                photo = ImageTk.PhotoImage(img)
+                self._balance_photos.append(photo)
+                w, h = img.size
+                cv.config(width=w, height=h)
+                cv.create_image(0, 0, image=photo, anchor="nw")
+                f_close = tkfont.Font(family="Microsoft YaHei UI", size=11)
+                cv.create_text(w - 12, 10, text="✕", font=f_close, fill="#FFD9E6",
+                               tags=("close",))
+                self._balance_win_w = w
+                self._balance_win_h = h
+                self._balance_win.geometry(f"{w}x{h}")
+                self._place_balance()
+                return
+            except Exception as e:
+                log_msg(f"整卡徽章渲染失败: {e}")
+        # 素材缺失兜底：普通文字
+        f_num = tkfont.Font(family="Consolas", size=20, weight="bold")
+        cv.create_text(pad_x, pad_y, text=text, anchor="nw",
+                       font=f_num, fill="#FF6B6B")
+        x = pad_x + f_num.measure(text) + 20
+        w = max(x + 22, pad_x * 2 + 20)
+        h = max(pad_y + 56 + pad_y, 46)
+        cv.config(width=w, height=h)
+        f_close = tkfont.Font(family="Microsoft YaHei UI", size=11)
+        cv.create_text(w - 12, 10, text="✕", font=f_close, fill="#FFD9E6",
+                       tags=("close",))
+        self._balance_win_w = w
+        self._balance_win_h = h
+        self._balance_win.geometry(f"{w}x{h}")
+        self._place_balance()
+
+    def _balance_flash(self):
+        """阶段转换时，徽章周边闪一次白光"""
+        cv = self._balance_cv
+        if cv is None:
+            return
+        try:
+            w = self._balance_win_w or cv.winfo_width()
+            h = self._balance_win_h or cv.winfo_height()
+            r1 = self._rounded_rect(cv, 2, 2, w - 3, h - 3, 10,
+                                    fill="", outline="#FFFFFF", width=4, tags="flash")
+            r2 = self._rounded_rect(cv, 6, 6, w - 7, h - 7, 8,
+                                    fill="", outline="#FFFFFF", width=2, tags="flash")
+
+            def fade(i):
+                if not self._alive:
+                    return
+                try:
+                    if cv.winfo_exists() == 0:
+                        return
+                except Exception:
+                    return
+                if i >= len(FLASH_STEPS):
+                    try:
+                        cv.delete("flash")
+                    except Exception:
+                        pass
+                    return
+                cv.itemconfig(r1, outline=FLASH_STEPS[i])
+                cv.itemconfig(r2, outline=FLASH_STEPS[i])
+                try:
+                    cv.after(55, lambda: fade(i + 1))
+                except Exception:
+                    pass
+
+            fade(0)
+        except Exception as e:
+            log_msg(f"余额闪光失败: {e}")
+
+    def _create_balance_win(self):
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.config(bg="#010203")   # 近黑透明键（纯黑留给徽章黑色粗边框）
+        try:
+            win.attributes("-transparentcolor", "#010203")
+        except Exception:
+            pass
+        cv = tk.Canvas(win, bg="#010203", highlightthickness=0, bd=0)
+        cv.pack()
+        win.update_idletasks()
+        self._balance_win = win
+        self._balance_cv = cv
+        self._balance_photos = []
+        self._balance_win_w = 220
+        self._balance_win_h = 60
+        self._balance_tier_key = None
+        cv.bind("<Button-1>", lambda e: self._balance_canvas_press(e))
+        cv.bind("<B1-Motion>", lambda e: self._balance_drag_move(e))
+        cv.tag_bind("close", "<Button-1>", lambda e: self._close_balance())
+        self._place_balance()
+        log_msg("DeepSeek 余额徽章已显示（喧响值风格）")
+
+    def _balance_canvas_press(self, e):
+        try:
+            cur = self._balance_cv.find_withtag("current")
+            if cur and "close" in self._balance_cv.gettags(cur[0]):
+                return
+            self._balance_drag_start(e)
+        except Exception:
+            pass
+
+    def _balance_drag_start(self, e):
+        try:
+            self._balance_drag_off = (e.x_root - self._balance_win.winfo_x(),
+                                      e.y_root - self._balance_win.winfo_y())
+        except Exception:
+            pass
+
+    def _balance_drag_move(self, e):
+        try:
+            ox, oy = self._balance_drag_off
+            self._balance_win.geometry(f"+{int(e.x_root - ox)}+{int(e.y_root - oy)}")
+        except Exception:
+            pass
+
+    def _place_balance(self):
+        if self._balance_win is None:
+            return
+        try:
+            px = self.root.winfo_rootx()
+            py = self.root.winfo_rooty()
+            sw = self._balance_win.winfo_screenwidth()
+            sh = self._balance_win.winfo_screenheight()
+            w = self._balance_win_w or self._balance_win.winfo_width() or 220
+            h = self._balance_win_h or self._balance_win.winfo_height() or 60
+            gap = 6
+            off = self._plugin_offset("deepseek-balance")
+            if off is not None:
+                # 控制台自定义位置：插件中心相对桌宠中心的偏移
+                ox, oy = off
+                x = px + self._pet_size / 2.0 + ox - w / 2.0
+                y = py + self._pet_size / 2.0 + oy - h / 2.0
+            else:
+                x = px + (self._pet_size - w) // 2   # 默认：桌宠正下方居中
+                y = py + self._pet_size + gap
+                if y + h > sh - 4:                   # 底部放不下 → 放到桌宠上方
+                    y = max(2, py - h - gap)
+            # 屏幕边缘兜底
+            if x < 2:
+                x = 2
+            if x + w > sw - 4:
+                x = max(2, sw - w - 4)
+            if y < 2:
+                y = 2
+            if y + h > sh - 4:
+                y = max(2, sh - h - 4)
+            self._balance_win.geometry(f"+{int(x)}+{int(y)}")
+        except Exception:
+            pass
+
+    def _plugin_offset(self, pid):
+        """读取插件中心偏移；缩放过程中优先用内存里的缩放后偏移，否则读 config"""
+        if pid in self._plugin_offsets:
+            return self._plugin_offsets[pid]
+        try:
+            cfg = load_config()
+            pos = (cfg.get("plugin_positions") or {}).get(pid)
+            if isinstance(pos, dict) and "x" in pos and "y" in pos:
+                return float(pos["x"]), float(pos["y"])
+        except Exception:
+            pass
+        return None
+
+    def _scale_plugin_offsets(self, ratio):
+        """桌宠缩放时，把所有插件相对桌宠中心的偏移按同一比例缩放（整体缩放）"""
+        if ratio <= 0:
+            return
+        try:
+            cfg = load_config()
+            pos_map = cfg.get("plugin_positions") or {}
+            for pid, pos in pos_map.items():
+                if isinstance(pos, dict) and "x" in pos and "y" in pos:
+                    try:
+                        self._plugin_offsets[pid] = (float(pos["x"]) * ratio,
+                                                     float(pos["y"]) * ratio)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log_msg(f"插件偏移整体缩放失败: {e}")
+
+    def get_plugin_positions(self):
+        """返回桌宠尺寸 + 所有已启用插件的相对位置（中心偏移）"""
+        out = {}
+        for p in self._plugins:
+            pid = p["manifest"].get("id", os.path.basename(p["dir"]))
+            if pid not in self._enabled_plugins:
+                continue
+            off = self._plugin_offset(pid)
+            if off is not None:
+                out[pid] = {"x": off[0], "y": off[1]}
+                continue
+            if pid == "deepseek-balance":
+                w = self._balance_win_w or 220
+                h = self._balance_win_h or 60
+                out[pid] = {"x": 0.0,
+                            "y": float(self._pet_size / 2.0 + 6 + h / 2.0)}
+        return {"pet_size": self._pet_size, "plugins": out}
+
+    def apply_plugin_position(self, pid, x, y):
+        """保存插件相对桌宠的位置（中心偏移）并即时应用"""
+        try:
+            x = float(x)
+            y = float(y)
+            self._plugin_offsets.pop(pid, None)
+            cfg = load_config()
+            pos_map = dict(cfg.get("plugin_positions") or {})
+            pos_map[pid] = {"x": x, "y": y}
+            save_config({"plugin_positions": pos_map})
+            if pid == "deepseek-balance":
+                self.root.after(0, self._place_balance)
+            log_msg(f"插件位置已更新 {pid}: ({x:.0f}, {y:.0f})")
+            return True
+        except Exception as e:
+            log_msg(f"保存插件位置失败 [{pid}]: {e}")
+            return False
+
+    def reset_plugin_position(self, pid):
+        """删除自定义位置，恢复插件默认位置"""
+        try:
+            self._plugin_offsets.pop(pid, None)
+            cfg = load_config()
+            pos_map = dict(cfg.get("plugin_positions") or {})
+            if pid in pos_map:
+                del pos_map[pid]
+                save_config({"plugin_positions": pos_map})
+            if pid == "deepseek-balance":
+                self.root.after(0, self._place_balance)
+            log_msg(f"插件位置已重置 {pid}")
+            return True
+        except Exception as e:
+            log_msg(f"重置插件位置失败 [{pid}]: {e}")
+            return False
+
+    def get_balance_tiers(self):
+        """返回当前余额档位阈值（极/特/喧 的三个界限）"""
+        return {"tiers": [float(x) for x in (self._balance_tiers or [20, 50, 80])]}
+
+    def set_balance_tiers(self, tiers):
+        """设置余额档位阈值并实时生效：低于第一个数为极，低于第二个为特，低于第三个为喧"""
+        try:
+            vals = [float(x) for x in (tiers or [])]
+            if len(vals) != 3 or not (vals[0] < vals[1] < vals[2]):
+                return False
+            self._balance_tiers = vals
+            save_config({"deepseek_balance_tiers": vals})
+            if self._balance_displayed:
+                self.root.after(0, lambda: self._render_balance(
+                    self._balance_displayed, self._balance_last_ok))
+            log_msg(f"档位阈值已更新: {vals}")
+            return True
+        except Exception as e:
+            log_msg(f"档位设置失败: {e}")
+            return False
+
+    def pet_preview_png(self):
+        """桌宠 silent 首帧缩略 PNG（预览区中心图标），缓存"""
+        if self._pet_preview_cache is None:
+            try:
+                im = Image.open(GIF_FILES.get("silent"))
+                im.seek(0)
+                frame = im.convert("RGBA").copy()
+                frame.thumbnail((260, 260), Image.LANCZOS)
+                buf = io.BytesIO()
+                frame.save(buf, "PNG")
+                self._pet_preview_cache = buf.getvalue()
+            except Exception as e:
+                log_msg(f"桌宠预览图生成失败: {e}")
+                return None
+        return self._pet_preview_cache
+
+    def plugin_preview_png(self, pid, tier=None):
+        """插件示例缩略 PNG（预览区 + 卡片示例图 + 档位示例），缓存。
+        tier 指定档位（maximum/blasting/uproar/base）时渲染对应样例。"""
+        key = f"preview:{pid}" if not tier else f"preview:{pid}:{tier}"
+        if key in self._plugin_preview_cache:
+            return self._plugin_preview_cache[key]
+        data = None
+        if pid == "deepseek-balance" and self._badge_render is not None:
+            try:
+                char_h = int(220 * 3 / 16 * 1.5 * 2 / 3)   # 与运行时比例一致
+                if tier:
+                    sample_num = {"maximum": "5.00", "blasting": "25.00",
+                                  "uproar": "75.00", "base": "120.00"}.get(tier, "12.34")
+                    img = self._badge_render.compose(tier, sample_num, char_h=char_h)
+                else:
+                    img = self._badge_render.compose("blasting", "12.34", char_h=char_h)
+                img.thumbnail((230, 130), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, "PNG")
+                data = buf.getvalue()
+            except Exception as e:
+                log_msg(f"插件示例图生成失败 [{pid}]: {e}")
+        if data:
+            self._plugin_preview_cache[key] = data
+        return data
+
+    def _close_balance(self):
+        if self._balance_refresh_id is not None:
+            try:
+                self.root.after_cancel(self._balance_refresh_id)
+            except Exception:
+                pass
+            self._balance_refresh_id = None
+        if self._balance_win is not None:
+            try:
+                self._balance_win.destroy()
+            except Exception:
+                pass
+        self._balance_win = None
+        self._balance_cv = None
+        self._balance_photos = []
+        self._balance_tier_key = None
+        log_msg("DeepSeek 余额徽章已关闭")
 
     # ─────────────── 微信风格气泡（白色 + 粉色不透明） ───────────────
 
@@ -1147,19 +1732,19 @@ class DesktopPet:
         self._place_bubble()
         log_msg("气泡已弹出")
 
-    def _place_bubble(self):
-        """把气泡放在宠物正上方，尾巴压住宠物顶部；拖拽时跟随"""
-        if self._bubble_win is None:
+    def _place_above_pet(self, win, cv):
+        """把气泡/审批窗口放在宠物上方居中，无空间则放下方，跟随宠物"""
+        if win is None:
             return
         try:
             px = self.root.winfo_rootx()
             py = self.root.winfo_rooty()
-            sw = self._bubble_win.winfo_screenwidth()
-            sh = self._bubble_win.winfo_screenheight()
-            w = self._bubble_win.winfo_width() or self._bubble_cv.winfo_reqwidth()
-            h = self._bubble_win.winfo_height() or self._bubble_cv.winfo_reqheight()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            w = win.winfo_width() or cv.winfo_reqwidth()
+            h = win.winfo_height() or cv.winfo_reqheight()
             x = px + (self._pet_size - w) // 2
-            y = py - h + 4            # 气泡底部（含尾巴）压住宠物顶部 4px
+            y = py - h + 4            # 底部（含尾巴）压住宠物顶部 4px
             if y < 0:
                 # 顶部没空间时放到宠物下方
                 y = py + self._pet_size + 4
@@ -1169,9 +1754,13 @@ class DesktopPet:
                 x = max(0, sw - w)
             if y + h > sh:
                 y = max(0, sh - h)
-            self._bubble_win.geometry(f"+{int(x)}+{int(y)}")
+            win.geometry(f"+{int(x)}+{int(y)}")
         except Exception:
             pass
+
+    def _place_bubble(self):
+        """气泡跟随宠物（上方居中，无空间则下方）"""
+        self._place_above_pet(self._bubble_win, self._bubble_cv)
 
     def _hide_bubble(self):
         if self._bubble_win is not None:
@@ -1326,29 +1915,8 @@ class DesktopPet:
         log_msg(f"审批请求已弹出: call={call_id} cmd={command[:60]!r}")
 
     def _place_approval(self):
-        """把审批窗口放在宠物上方，跟随宠物"""
-        if self._approval_win is None:
-            return
-        try:
-            px = self.root.winfo_rootx()
-            py = self.root.winfo_rooty()
-            sw = self._approval_win.winfo_screenwidth()
-            sh = self._approval_win.winfo_screenheight()
-            w = self._approval_win.winfo_width() or self._approval_cv.winfo_reqwidth()
-            h = self._approval_win.winfo_height() or self._approval_cv.winfo_reqheight()
-            x = px + (self._pet_size - w) // 2
-            y = py - h + 4
-            if y < 0:
-                y = py + self._pet_size + 4
-            if x < 0:
-                x = 0
-            if x + w > sw:
-                x = max(0, sw - w)
-            if y + h > sh:
-                y = max(0, sh - h)
-            self._approval_win.geometry(f"+{int(x)}+{int(y)}")
-        except Exception:
-            pass
+        """审批窗口跟随宠物（上方居中，无空间则下方）"""
+        self._place_above_pet(self._approval_win, self._approval_cv)
 
     def _approval_action(self, action):
         """用户点了允许/总是允许/拒绝：关窗，后台去点 Codex 应用里的按钮"""
@@ -1400,8 +1968,6 @@ class DesktopPet:
     # ─────────────── 左键：单击反馈 / 双击收起 / 拖拽 ───────────────
 
     def _on_lb_press(self, e):
-        if self._menu_win is not None:   # 菜单开着时，先关菜单
-            self._close_menu()
         # 按在右下角缩放把手上 → 进入缩放模式
         try:
             cur = self.canvas.find_withtag("current")
@@ -1432,6 +1998,7 @@ class DesktopPet:
                 pass
             self._press_pos = (e.x_root, e.y_root)
             self._place_bubble()   # 气泡跟着宠物走
+            self._place_balance()  # 余额徽章跟着宠物走
 
     def _on_lb_release(self, e):
         if self._resizing:
@@ -1506,7 +2073,6 @@ class DesktopPet:
         self._suppress_single = time.time()
         self._hide_bubble()
         self._approval_hide()
-        self._close_menu()
         self._open_codex()
 
     def _do_single_click(self):
@@ -1521,25 +2087,16 @@ class DesktopPet:
             return
         self._set_state("afterclick")    # silent/work：仅播放单击动画，不打开任何窗口
 
-    # ─────────────── 右键：单击菜单 / 双击退出 ───────────────
+    # ─────────────── 右键：单击打开本地控制台 / 双击退出 ───────────────
 
     def _on_rb_press(self, e):
-        if self._menu_win is not None:
-            self._close_menu()
-            if self._rb_timer is not None:
-                try:
-                    self.root.after_cancel(self._rb_timer)
-                except Exception:
-                    pass
-                self._rb_timer = None
-            return
         if self._rb_timer is not None:
             return   # 双击第二击，交给 Double-Button-3
         self._rb_timer = self.root.after(320, self._rb_single)
 
     def _rb_single(self):
         self._rb_timer = None
-        self._show_menu()
+        self._open_console()
 
     def _on_rb_double(self, e):
         if self._rb_timer is not None:
@@ -1548,125 +2105,7 @@ class DesktopPet:
             except Exception:
                 pass
             self._rb_timer = None
-        self._close_menu()
         self._quit()
-
-    # ─────────────── 右键菜单（真实图标，点击即图片） ───────────────
-
-    def _show_menu(self):
-        if not LAUNCH_APPS:
-            log_msg("未探测到可启动的应用，右键菜单为空")
-            return
-        if self._menu_win is not None and self._menu_win.winfo_exists():
-            return
-        items = [(n, ic, 1.0) for (n, _p, ic) in LAUNCH_APPS]
-        n = len(items)
-        icon_sz = 56
-        gap = 12
-        pad = 12
-        w = icon_sz + pad * 2
-        h = n * icon_sz + (n - 1) * gap + pad * 2
-
-        menu = tk.Toplevel(self.root)
-        menu.overrideredirect(True)
-        menu.attributes("-topmost", True)
-        menu.config(bg="#FFF3F6")            # 实底，不透明：点击 100% 可靠
-        self._menu_win = menu
-
-        cv = tk.Canvas(menu, width=w, height=h, bg="#FFF3F6", highlightthickness=0)
-        cv.pack()
-
-        self._menu_tk_refs = []
-        for i, (name, icon_file, scale) in enumerate(items):
-            x = w // 2
-            y = pad + icon_sz // 2 + i * (icon_sz + gap)
-            sz_i = max(16, int(icon_sz * scale))
-            img = self._load_icon(icon_file, sz_i)
-            if img is None:
-                img = self._fallback_icon(name, sz_i)
-            self._menu_tk_refs.append(img)
-            tag = f"mi_{i}"
-            cv.create_image(x, y, image=img, tags=tag)
-            # 点击图片本身 → 启动（按下即触发，最直接可靠）
-            cv.tag_bind(tag, "<Button-1>", lambda e, idx=i: self._menu_click(idx))
-
-        # 点击面板空白/右键 → 关闭菜单
-        cv.bind("<Button-1>", lambda e: self._close_menu())
-        cv.bind("<Button-3>", lambda e: self._close_menu())
-
-        # 定位到桌宠右侧
-        try:
-            px = self.root.winfo_rootx()
-            py = self.root.winfo_rooty()
-            sw = menu.winfo_screenwidth()
-            sh = menu.winfo_screenheight()
-        except Exception:
-            px = py = 0
-            sw, sh = 1920, 1080
-        x = px + self._pet_size + 10
-        y = py + (self._pet_size - h) // 2
-        if y + h > sh - 8:
-            y = sh - h - 8
-        if y < 0:
-            y = 0
-        if x + w > sw - 8:
-            x = max(0, px - w - 10)
-        menu.geometry(f"+{int(x)}+{int(y)}")
-        self._menu_close_after = self.root.after(8000, self._close_menu)
-        log_msg(f"菜单已打开: {len(items)} 个按钮 @ ({int(x)},{int(y)})")
-
-    def _menu_click(self, idx):
-        if 0 <= idx < len(LAUNCH_APPS):
-            name, path, _icon = LAUNCH_APPS[idx]
-            log_msg(f"点击菜单 '{name}'")
-            ok = launch_app(path)
-            log_msg(f"启动结果: {'OK' if ok else 'FAIL'}")
-        self._close_menu()
-
-    def _close_menu(self):
-        if self._menu_close_after is not None:
-            try:
-                self.root.after_cancel(self._menu_close_after)
-            except Exception:
-                pass
-            self._menu_close_after = None
-        if self._menu_win is not None:
-            try:
-                self._menu_win.destroy()
-            except Exception:
-                pass
-        self._menu_win = None
-
-    def _load_icon(self, icon_file, sz):
-        """加载 素材/菜单图标/<file>，等比缩放居中"""
-        try:
-            path = os.path.join(MENU_ICON_DIR, icon_file)
-            if not os.path.exists(path):
-                log_msg(f"图标缺失: {path}")
-                return None
-            im = Image.open(path).convert("RGBA")
-            im.thumbnail((sz, sz), Image.LANCZOS)
-            bg = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-            bg.paste(im, ((sz - im.width) // 2, (sz - im.height) // 2), im)
-            return ImageTk.PhotoImage(bg)
-        except Exception as e:
-            log_msg(f"图标加载失败 {icon_file}: {e}")
-            return None
-
-    def _fallback_icon(self, name, sz):
-        """图标缺失时的兜底：白底圆 + 名字首字"""
-        img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse([2, 2, sz - 3, sz - 3], fill=(255, 255, 255, 255),
-                  outline=(255, 120, 160, 255), width=2)
-        try:
-            from PIL import ImageFont
-            font = ImageFont.truetype("msyh.ttc", int(sz * 0.32))
-            d.text((sz // 2, sz // 2), name[:1], font=font,
-                   fill=(80, 40, 60, 255), anchor="mm")
-        except Exception:
-            pass
-        return ImageTk.PhotoImage(img)
 
 
 if __name__ == "__main__":

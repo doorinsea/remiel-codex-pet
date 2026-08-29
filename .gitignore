@@ -19,6 +19,9 @@ uia_result.txt
 # 本机配置（个人化，不进仓库；模板见 config.example.json）
 config.json
 
+# 本地插件（暂不上传；需要分享时移除此行）
+plugins/
+
 # 系统文件
 Thumbs.db
 Desktop.ini

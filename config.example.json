@@ -1,4 +1,16 @@
 {
+  "deepseek_api_key": "",
+  "deepseek_balance_tiers": [
+    20,
+    50,
+    80
+  ],
+  "plugin_positions": {
+    "deepseek-balance": {
+      "x": 0,
+      "y": 110
+    }
+  },
   "launch_apps": [
     {
       "name": "微信",
