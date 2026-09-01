@@ -1118,7 +1118,7 @@ class DesktopPet:
         text = res.get("text", "?")
         ok = bool(res.get("ok"))
         if not ok:
-            text = f"余额 {text}"
+            text = f"余额 {text}"[:36]   # 截断错误信息，避免徽章窗口被撑大
         if self._balance_win is None:
             self._create_balance_win()
         self._render_balance(text, ok)
@@ -1135,15 +1135,17 @@ class DesktopPet:
         return "base"            # 余额充足 → 无等级
 
     def _render_balance(self, text, ok):
-        m = re.search(r"([\d.]+)", text)
         amount = None
         tier = "base"
-        if m:
-            try:
-                amount = float(m.group(1))
-                tier = self._balance_tier(amount)
-            except Exception:
-                amount = None
+        if ok:
+            # 仅在接口成功时提取余额数字，避免把错误文本里的数字（如 WinError 10061）当成余额
+            m = re.search(r"([\d.]+)", text)
+            if m:
+                try:
+                    amount = float(m.group(1))
+                    tier = self._balance_tier(amount)
+                except Exception:
+                    amount = None
         log_msg(f"余额徽章渲染: amount={amount} tier={tier}")
         if self._balance_win is None or self._balance_cv is None:
             return
