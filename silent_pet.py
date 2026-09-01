@@ -424,13 +424,17 @@ class CodexWatcher(threading.Thread):
         for p in list(self._states):
             if p not in files:
                 del self._states[p]
+        is_first_scan = not self._first_scan_done
+        started = False
+        completed = False
         # 新增会话：全量扫描
         for p in files:
             if p not in self._states:
-                self._states[p] = self._scan(p)
-
-        started = False
-        completed = False
+                st = self._scan(p)
+                self._states[p] = st
+                # 新会话首次扫描即处于思考中：直接上报 busy，避免新对话漏检
+                if not is_first_scan and st.get("busy") is True:
+                    started = True
         for p in files:
             st = self._states[p]
             self._apply(st, self._read_new(p, st))
@@ -449,7 +453,6 @@ class CodexWatcher(threading.Thread):
             for p, st in self._states.items()
         )
 
-        is_first_scan = not self._first_scan_done
         if is_first_scan:
             # 首轮扫描：若已有会话在思考，直接进入 think
             if self._any_busy and self._on_busy is not None:
