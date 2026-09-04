@@ -100,6 +100,10 @@ BUBBLE_TAIL_H = 12              # 朝下尾巴高
 BUBBLE_TAIL_W = 18              # 朝下尾巴宽
 BUBBLE_RADIUS = 14              # 圆角半径
 
+# 自动审批通过通知气泡
+APPROVED_NOTICE_TEXT = "hello~已自动审批通过"
+APPROVED_NOTICE_HOLD_MS = 4000  # 通知气泡保持时长（毫秒）
+
 # Codex 审批窗口（与气泡同风格：粉色不透明）
 APPROVAL_ALPHA = 1.0            # 不透明（可调 0.0~1.0）
 APPROVAL_BG = "#FFF4F9"         # 近白带粉，微信气泡底色
@@ -238,6 +242,7 @@ class CodexWatcher(threading.Thread):
 
     def __init__(self, sessions_dir, on_busy, on_done,
                  on_approval=None, on_approval_resolved=None,
+                 on_auto_approved=None,
                  poll_ms=CODEX_POLL_MS):
         super().__init__(daemon=True)
         self._sessions_dir = sessions_dir
@@ -245,6 +250,7 @@ class CodexWatcher(threading.Thread):
         self._on_done = on_done
         self._on_approval = on_approval
         self._on_approval_resolved = on_approval_resolved
+        self._on_auto_approved = on_auto_approved
         self._poll_ms = poll_ms
         self._states = {}          # path -> 会话状态
         self._internal_cache = {}  # path -> 是否内部评估线程（guardian）
@@ -388,7 +394,11 @@ class CodexWatcher(threading.Thread):
             elif t == "response_item" and pt == "function_call_output":
                 call_id = p.get("call_id")
                 if call_id:
-                    st["pending"].pop(call_id, None)
+                    info = st["pending"].pop(call_id, None)
+                    # 从未弹过桌宠审批窗就收到输出 → approve for me 已自动批准
+                    if info is not None and call_id not in st["notified"]:
+                        st.setdefault("auto_approved", []).append(
+                            (call_id, info.get("args", {})))
 
     def _scan(self, path):
         """新文件全量扫描：只建状态，不触发历史事件"""
@@ -464,6 +474,13 @@ class CodexWatcher(threading.Thread):
             if completed and self._on_done is not None:
                 self._on_done()
 
+        # 自动批准：消费观察期内已收到输出的升级命令（启动首轮不重放历史）
+        for p in files:
+            st = self._states[p]
+            for call_id, args in st.pop("auto_approved", []):
+                if not is_first_scan and self._on_auto_approved is not None:
+                    self._on_auto_approved(call_id, args)
+
         # 审批：仅增量弹窗。新升级命令先观察 APPROVAL_OBSERVE_SECONDS 秒，
         # 期间若自动批准（function_call_output 出现）则不打扰；观察窗过后再
         # 用 UIA 探测 Codex 应用里是否真有审批卡片，有才弹窗；
@@ -482,8 +499,11 @@ class CodexWatcher(threading.Thread):
                         else:
                             info["checks"] = info.get("checks", 0) + 1
                             if info["checks"] >= APPROVAL_DETECT_RETRIES:
-                                # 多次探测无卡片 → approve for me 已自动批准，不再打扰
+                                # 多次探测无卡片 → approve for me 已自动批准
                                 st["notified"].add(call_id)
+                                if self._on_auto_approved is not None:
+                                    self._on_auto_approved(
+                                        call_id, info.get("args", {}))
             for call_id in list(st["notified"]):
                 if call_id not in st["pending"]:
                     st["notified"].discard(call_id)
@@ -552,6 +572,10 @@ class DesktopPet:
         # ── 微信风格气泡 ──
         self._bubble_win = None
         self._bubble_cv = None
+        # ── 自动审批通知气泡 ──
+        self._notice_win = None
+        self._notice_cv = None
+        self._notice_timer = None
 
         # ── Codex 审批窗口 ──
         self._approval_win = None
@@ -582,6 +606,7 @@ class DesktopPet:
             on_done=self._on_codex_done_thread,
             on_approval=self._on_approval_thread,
             on_approval_resolved=self._on_approval_resolved_thread,
+            on_auto_approved=self._on_auto_approved_thread,
         )
         self._watcher.start()
 
@@ -643,6 +668,7 @@ class DesktopPet:
             pass
         self._cancel_happy_timer()
         self._approval_hide()
+        self._hide_notice()
         self._close_balance()
         try:
             self.root.destroy()
@@ -939,6 +965,7 @@ class DesktopPet:
             return                       # happy 保持期不被思考打断
         self._cancel_happy_timer()
         self._hide_bubble()
+        self._hide_notice()
         self._approval_hide()
         self._set_state("think")
         log_msg("Codex 开始思考 → think")
@@ -956,6 +983,7 @@ class DesktopPet:
             return
         self._cancel_happy_timer()
         self._approval_hide()
+        self._hide_notice()
         self._set_state("happy")
         self._show_bubble()
         self._happy_timer = self.root.after(HAPPY_HOLD_MS, self._happy_timeout)
@@ -1506,12 +1534,8 @@ class DesktopPet:
         ]
         return cv.create_polygon(pts, smooth=True, **kw)
 
-    def _show_bubble(self):
-        if self._bubble_win is not None and self._bubble_win.winfo_exists():
-            self._place_bubble()
-            self._bubble_win.lift()
-            return
-
+    def _build_bubble_window(self, text):
+        """构建微信风格白色圆角气泡窗口（按文案自适应宽度 + 朝下尾巴），返回 (win, cv)"""
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
@@ -1524,7 +1548,7 @@ class DesktopPet:
 
         # 按文案实际宽度自适应气泡尺寸，避免文字被窗口裁掉
         f_bubble = tkfont.Font(family="Microsoft YaHei UI", size=12)
-        text_w = f_bubble.measure(BUBBLE_TEXT)
+        text_w = f_bubble.measure(text)
         max_single = 520
         body_w = min(max(BUBBLE_BODY_W, text_w + 36), max_single)
         lines = 1
@@ -1554,31 +1578,82 @@ class DesktopPet:
         if lines == 1:
             cv.create_text(
                 w // 2, (body_h + 2) // 2,
-                text=BUBBLE_TEXT, font=("Microsoft YaHei UI", 12),
+                text=text, font=("Microsoft YaHei UI", 12),
                 fill=BUBBLE_TEXT_FG,
             )
         else:
-            mid = len(BUBBLE_TEXT) // 2
+            mid = len(text) // 2
             cv.create_text(
                 w // 2, (body_h + 2) // 2 - 11,
-                text=BUBBLE_TEXT[:mid], font=("Microsoft YaHei UI", 12),
+                text=text[:mid], font=("Microsoft YaHei UI", 12),
                 fill=BUBBLE_TEXT_FG,
             )
             cv.create_text(
                 w // 2, (body_h + 2) // 2 + 11,
-                text=BUBBLE_TEXT[mid:], font=("Microsoft YaHei UI", 12),
+                text=text[mid:], font=("Microsoft YaHei UI", 12),
                 fill=BUBBLE_TEXT_FG,
             )
+        return win, cv
 
-        # 单击气泡任意处 = 收回
+    def _show_bubble(self):
+        if self._bubble_win is not None and self._bubble_win.winfo_exists():
+            self._place_bubble()
+            self._bubble_win.lift()
+            return
+        win, cv = self._build_bubble_window(BUBBLE_TEXT)
+        # 单击气泡任意处 = 收回（happy 结束）
         cv.bind("<Button-1>", lambda e: self._dismiss_bubble())
         win.bind("<Button-1>", lambda e: self._dismiss_bubble())
-
         self._bubble_win = win
         self._bubble_cv = cv
         win.update_idletasks()
         self._place_bubble()
         log_msg("气泡已弹出")
+
+    def _on_auto_approved_thread(self, call_id, args):
+        """watcher 线程：自动审批通过 → 转主线程弹通知气泡"""
+        try:
+            self.root.after(0, lambda: self._show_auto_approved_notice())
+        except Exception:
+            pass
+
+    def _show_auto_approved_notice(self):
+        """approve for me 自动批准后弹一次通知气泡（不打断当前桌宠状态）"""
+        if not self._alive:
+            return
+        if self._bubble_win is not None:
+            return    # happy 气泡展示期间不打扰
+        self._hide_notice()
+        win, cv = self._build_bubble_window(APPROVED_NOTICE_TEXT)
+        cv.bind("<Button-1>", lambda e: self._hide_notice())
+        win.bind("<Button-1>", lambda e: self._hide_notice())
+        self._notice_win = win
+        self._notice_cv = cv
+        win.update_idletasks()
+        self._place_above_pet(win, cv)
+        if self._notice_timer is not None:
+            try:
+                self.root.after_cancel(self._notice_timer)
+            except Exception:
+                pass
+        self._notice_timer = self.root.after(
+            APPROVED_NOTICE_HOLD_MS, self._hide_notice)
+        log_msg("自动审批通过通知气泡已弹出")
+
+    def _hide_notice(self):
+        if self._notice_timer is not None:
+            try:
+                self.root.after_cancel(self._notice_timer)
+            except Exception:
+                pass
+            self._notice_timer = None
+        if self._notice_win is not None:
+            try:
+                self._notice_win.destroy()
+            except Exception:
+                pass
+        self._notice_win = None
+        self._notice_cv = None
 
     def _place_above_pet(self, win, cv):
         """把气泡/审批窗口放在宠物上方居中，无空间则放下方，跟随宠物"""
